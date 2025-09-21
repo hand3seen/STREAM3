@@ -1,0 +1,467 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Headmosh Echo Yard — Dub Reactive</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/addons/p5.sound.min.js"></script>
+  <style>
+    html,body{margin:0;height:100%;background:#000;font-family:ui-sans-serif,system-ui,Inter,Roboto,Arial;cursor:default}
+    .pump-link{
+      position:fixed;left:18px;top:18px;z-index:9;background:rgba(0,0,0,.55);backdrop-filter:blur(6px);
+      border:1px solid rgba(255,255,255,.15);border-radius:12px;color:#e8f3ff;text-decoration:none;
+      padding:10px 14px;font-size:14px;line-height:1;display:flex;gap:10px;align-items:center
+    }
+    .pump-dot{width:8px;height:8px;border-radius:50%;background:rgb(60,200,255);box-shadow:0 0 12px 4px rgba(60,200,255,.7)}
+    #mic-hint{position:fixed;right:18px;top:18px;color:#cde;z-index:9;font-size:12px;background:rgba(0,0,0,.5);
+      padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12)}
+    #meter{position:fixed;left:18px;bottom:18px;width:240px;height:10px;background:#111;border:1px solid #333;border-radius:999px;overflow:hidden}
+    #meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#27ffbe,#4ca5ff)}
+  </style>
+</head>
+<body>
+  <a id="coinUrl" class="pump-link" target="_blank" rel="noreferrer">
+    <span class="pump-dot"></span>
+    <span id="coinText">pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump</span>
+  </a>
+  <div id="mic-hint">Press <b>M</b> to (re)enable mic/monitor • [K/J] Sens • [H] Bass bias • [E] Echo • [ / ] Feedback • [; / '] Delay • [G] Skank • [B] Bubbles • [N] Palette • [S] Subtle</div>
+  <div id="meter"><i></i></div>
+
+<script>
+/* ===== Headmosh Echo Yard — Dub Reactive =====
+   - Bass "bubbles" that float up on lows
+   - Tape-echo rings with feedback + delay time
+   - Skank grid pops on off-beats (2 & 4 vibes)
+   - Softer overall bloom; calmer trails for dub
+================================================================ */
+
+const CONFIG = {
+  particleDensity: 0.08,
+  maxSpeed: 1.2,
+  trailAlpha: 26,         // softer trail
+  bloomPasses: 0,         // off for subtle dub look
+  connectRadius: 160,
+  bannerTitle: "HEADMOSH STUDIO",
+  bannerSub: "Dub • Echo • Yard",
+  coinURL: "https://pump.fun/coin/4QCQAkcKiYPnFWsSgGMuGeQdnrAmCKcNJkd2dm59pump",
+};
+
+document.getElementById('coinText').textContent = CONFIG.coinURL.replace(/^https?:\/\//,'');
+document.getElementById('coinUrl').href = CONFIG.coinURL;
+
+let pg, t = 0;
+let palettes, paletteIndex = 0;
+let subtleMode = true;
+
+// Audio
+let mic, fft, amp, peakLow, peakMid;
+let audioEnabled = false;
+let energy = 0;
+let sensitivity = 1.35;         // slightly calmer default
+let extraBassBias = true;
+
+// Auto-gain
+let rms = 0;
+const RMS_ATTACK = 0.10;
+const RMS_DECAY  = 0.015;
+
+// Echo system
+let echoEnabled = true;
+let echoes = []; // {x,y,r,life,clr,vel}
+let echoDelayMs = 420;   // dubby default
+let echoFeedback = 0.52; // 0..0.85 reasonable
+let lastEchoAt = 0;
+
+// Bubbles (bass pops)
+let bubblesOn = true;
+let bubblePool = []; // {x,y,r,vy,life,clr}
+
+// Skank grid
+let showSkank = true;
+let beatTimes = []; // recent kick beats (ms)
+let lastBeatAt = 0;
+
+// Particles (chill backdrop)
+let particles = [];
+
+function setup(){
+  pixelDensity(1);
+  createCanvas(windowWidth, windowHeight);
+  pg = createGraphics(width, height);
+  pg.background(0);
+
+  palettes = [
+    // headmosh minimal w/ dub hints
+    [ [10,240,255], [255,210,60], [255,80,180], [180,90,255] ],
+    // warm sunset
+    [ [255,120,60], [255,200,80], [90,200,255], [200,160,255] ],
+    // rasta-leaning (muted)
+    [ [210,40,30], [230,190,40], [40,160,60], [120,220,200] ],
+    // ice & magenta
+    [ [120,240,255], [255,120,220], [255,240,160], [90,120,255] ],
+  ];
+
+  // ambient particles
+  initParticles();
+
+  // audio chain tuned for dub
+  fft = new p5.FFT(0.08, 2048);
+  amp = new p5.Amplitude(0.02);
+  peakLow = new p5.PeakDetect(35, 140, 0.10, 20); // kick/bass
+  peakMid = new p5.PeakDetect(600, 2000, 0.18, 12); // skank/clav
+}
+
+function initParticles(){
+  particles.length = 0;
+  const count = Math.floor(width * CONFIG.particleDensity);
+  for (let i=0;i<count;i++){
+    particles.push({
+      x: random(width),
+      y: random(height),
+      vx: random(-CONFIG.maxSpeed, CONFIG.maxSpeed),
+      vy: random(-CONFIG.maxSpeed, CONFIG.maxSpeed)
+    });
+  }
+}
+
+function draw(){
+  t++;
+  // ---------- ENERGY ----------
+  const ATTACK = 0.88;
+  const DECAY  = 0.18;
+  const BASS_BIAS = extraBassBias ? 0.86 : 0.65;
+
+  let target = 0;
+  let levelVis = 0;
+
+  if (audioEnabled){
+    const spectrum = fft.analyze();
+    const low  = fft.getEnergy(35, 140);
+    const mid  = fft.getEnergy(600, 2000);
+    const high = fft.getEnergy(2000, 6000);
+
+    // amplitude normalize
+    const lvl = amp.getLevel();
+    const targetRms = lvl;
+    if (targetRms > rms) rms += (targetRms - rms) * RMS_ATTACK;
+    else rms += (targetRms - rms) * RMS_DECAY;
+    const norm = rms > 0.0005 ? constrain(lvl / (rms*1.25), 0, 3.0) : 0;
+
+    // weighted energy; dub leans bass & mids
+    let e = (low * BASS_BIAS + mid * 0.28 + high * 0.05) / 255;
+    e = Math.max(e, norm * 0.85);
+
+    // peak detection
+    peakLow.update(fft);
+    peakMid.update(fft);
+
+    if (peakLow.isDetected){
+      onKick();
+      e = Math.min(1.35, e + 0.35);
+    }
+    if (peakMid.isDetected){
+      onSkank();
+      e = Math.min(1.25, e + 0.18);
+    }
+
+    target = Math.min(1.5, e * sensitivity);
+    levelVis = norm;
+  }
+
+  energy += (target - energy) * (target > energy ? ATTACK : DECAY);
+
+  // ---------- RENDER LAYERS ----------
+  pg.noStroke();
+  pg.fill(0, CONFIG.trailAlpha);
+  pg.rect(0,0,width,height);
+
+  drawBackdrop(pg);
+  moveParticles(pg);
+  renderEchoes(pg);
+  renderBubbles(pg);
+  if (showSkank) renderSkankGrid(pg);
+
+  // occasional soft screen flash on strong hits
+  if (!subtleMode && energy > 1.05){
+    push();
+    drawingContext.globalCompositeOperation = 'screen';
+    fill(255, 255, 255, map(energy,1.05,1.5,6,24));
+    rect(0,0,width,height);
+    pop();
+  }
+
+  image(pg, 0, 0);
+  // (Bloom intentionally off by default for dub)
+
+  drawBanner();
+  drawHUD(levelVis);
+}
+
+function drawBackdrop(g){
+  // vinyl wobble center glow
+  const wob = 1 + Math.sin(t*0.008 + energy*2.2)*0.02;
+  const cx = width*0.5 + Math.sin(t*0.0011)*60*(0.5+energy*0.8);
+  const cy = height*0.5 + Math.cos(t*0.0012)*44*(0.5+energy*0.8);
+  for (let r = Math.max(width,height); r>0; r -= 9){
+    const k = map(r, 0, Math.max(width,height), 0, 1);
+    const v = 12 + 22*(1-k)*wob;
+    g.noStroke();
+    g.fill(v, v*0.9, v*0.95, 14);
+    g.circle(cx, cy, r*2);
+  }
+}
+
+function moveParticles(g){
+  const cols = palettes[paletteIndex];
+  for (let p of particles){
+    // gentle flow + energy push
+    const ang = noise(p.x*0.0011, p.y*0.0011, t*0.001)*TAU*(0.9+energy*0.9);
+    const push = (0.02 + energy*0.09);
+    p.vx += Math.cos(ang) * push;
+    p.vy += Math.sin(ang) * push;
+
+    // clamp
+    const sp = Math.hypot(p.vx, p.vy);
+    const ms = CONFIG.maxSpeed*(0.8 + energy*0.6);
+    if (sp > ms){ p.vx = (p.vx/sp)*ms; p.vy = (p.vy/sp)*ms; }
+
+    p.x += p.vx; p.y += p.vy;
+    if (p.x < -12) p.x = width+12; if (p.x > width+12) p.x = -12;
+    if (p.y < -12) p.y = height+12; if (p.y > height+12) p.y = -12;
+
+    // dots
+    g.noStroke();
+    g.fill(255, 210);
+    g.circle(p.x, p.y, 2.4 + energy*1.4);
+
+    // short “wire” links for cohesion
+    if (random() < 0.035){
+      const q = particles[(p.__i || 0 + floor(random(5,20))) % particles.length];
+      const d = dist(p.x,p.y,q.x,q.y);
+      if (d < 140){
+        const c = cols[floor(map(d,0,140,0,cols.length))%cols.length];
+        g.stroke(c[0], c[1], c[2], 120);
+        g.strokeWeight(0.7 + energy*0.9);
+        g.line(p.x, p.y, q.x, q.y);
+      }
+    }
+  }
+}
+
+function renderEchoes(g){
+  // rings expand & fade; feedback re-injects smaller rings
+  const cols = palettes[paletteIndex];
+  const now = millis();
+
+  // feedback: create delayed child rings
+  if (echoEnabled && now - lastEchoAt >= echoDelayMs && beatTimes.length){
+    lastEchoAt = now;
+    // spawn an echo at center with small random offset
+    const cx = width*0.5 + random(-30,30);
+    const cy = height*0.5 + random(-20,20);
+    const base = cols[int(random(cols.length))];
+    echoes.push({
+      x: cx, y: cy, r: 4, life: 1.0,
+      vel: 3.2 + energy*2.2,
+      clr: [base[0], base[1], base[2], 210]
+    });
+    // attenuate existing via feedback feel
+    for (let e of echoes) e.life *= (0.92 + echoFeedback*0.05);
+  }
+
+  // draw/update
+  g.noFill();
+  for (let i=echoes.length-1; i>=0; i--){
+    const e = echoes[i];
+    e.r += e.vel*(0.9 + energy*0.4);
+    e.life *= 0.985;
+    const a = 180 * e.life;
+    if (a < 6 || e.r > Math.max(width,height)) { echoes.splice(i,1); continue; }
+    g.stroke(e.clr[0], e.clr[1], e.clr[2], a);
+    g.strokeWeight(2.2 + energy*1.8);
+    g.circle(e.x, e.y, e.r*2);
+  }
+}
+
+function renderBubbles(g){
+  // update bubbles
+  for (let i=bubblePool.length-1; i>=0; i--){
+    const b = bubblePool[i];
+    b.y += b.vy;
+    b.r += 0.06 + energy*0.08;
+    b.life *= 0.986;
+    const a = 220 * b.life;
+    if (a < 8 || b.y + b.r < -10){ bubblePool.splice(i,1); continue; }
+    g.noStroke();
+    g.fill(b.clr[0], b.clr[1], b.clr[2], a);
+    g.circle(b.x, b.y, b.r*2);
+  }
+}
+
+function renderSkankGrid(g){
+  // find rough bpm from kick intervals
+  const bpm = estimateBPM();
+  if (!bpm) return;
+  const spb = 60000 / bpm;
+  const now = millis();
+  const since = now - (beatTimes[beatTimes.length-1] || now);
+  // off-beat emphasis around half-spb window
+  const offBeatPhase = abs((since % spb) - spb/2);
+  const throb = map(offBeatPhase, 0, spb/3, 1, 0, true) * (0.5 + energy*0.8);
+
+  const cols = palettes[paletteIndex];
+  const c = cols[1];
+  g.push();
+  g.stroke(c[0], c[1], c[2], 90 + throb*120);
+  g.strokeWeight(2.2 + throb*2);
+  // diagonal “skank” lines
+  const gap = 48;
+  const off = (t*0.9) % gap;
+  for (let y=-gap; y<height+gap; y+=gap){
+    g.line(-gap, y+off, width+gap, y+off - 36);
+  }
+  g.pop();
+}
+
+function estimateBPM(){
+  // simple: average last 6 kick intervals
+  if (beatTimes.length < 4) return null;
+  const arr = beatTimes.slice(-6);
+  let iv = [];
+  for (let i=1;i<arr.length;i++) iv.push(arr[i]-arr[i-1]);
+  const avg = iv.reduce((a,b)=>a+b,0) / iv.length;
+  const bpm = 60000 / avg;
+  if (bpm < 60 || bpm > 180) return null;
+  return bpm;
+}
+
+/* ===== AUDIO EVENTS ===== */
+function onKick(){
+  const now = millis();
+  lastBeatAt = now;
+  beatTimes.push(now);
+  if (beatTimes.length > 12) beatTimes.shift();
+
+  // spawn echo seed immediately (parent ring)
+  if (echoEnabled){
+    const cols = palettes[paletteIndex];
+    const base = cols[int(random(cols.length))];
+    echoes.push({
+      x: width*0.5 + random(-40,40),
+      y: height*0.5 + random(-28,28),
+      r: 6, life: 1.0,
+      vel: 3.6 + energy*2.6,
+      clr: [base[0], base[1], base[2], 230]
+    });
+  }
+
+  // spawn bubbles on bass
+  if (bubblesOn){
+    const cols = palettes[paletteIndex];
+    const base = cols[int(random(cols.length))];
+    const n = 3 + int(random(3));
+    for (let i=0;i<n;i++){
+      bubblePool.push({
+        x: random(width),
+        y: height + random(10, 80),
+        r: random(3, 10) + energy*6,
+        vy: -(1.2 + random(0.8) + energy*1.6),
+        life: 1.0,
+        clr: [base[0], base[1], base[2]]
+      });
+    }
+  }
+}
+
+function onSkank(){
+  // small color flicker by nudging palette
+  if (random() < 0.22) paletteIndex = (paletteIndex+1)%palettes.length;
+}
+
+/* ===== UI / HUD ===== */
+function drawBanner(){
+  const title = CONFIG.bannerTitle;
+  const sub = CONFIG.bannerSub;
+
+  push();
+  textAlign(LEFT, TOP);
+  noStroke();
+  fill(0, 150);
+  textSize(40);
+  const w = textWidth(title) + 240;
+  rect(18, 72, w, 80, 16);
+
+  fill(255, 255, 255, 40);
+  text(title, 36 + 1, 88 + 1);
+  fill(245);
+  text(title, 36, 88);
+
+  textSize(18);
+  fill(215);
+  text(sub, 36, 124);
+  pop();
+}
+
+function drawHUD(levelVis=0){
+  const meter = document.querySelector('#meter > i');
+  if (meter) meter.style.width = Math.min(1, levelVis).toFixed(3) * 100 + '%';
+
+  const hud = `Sens ${sensitivity.toFixed(2)}  Bass ${extraBassBias?"BIAS":"norm"}  Echo ${echoEnabled?"on":"off"}  Fb ${echoFeedback.toFixed(2)}  Dly ${echoDelayMs}ms  Subtle ${subtleMode?"on":"off"}  RMS ${rms.toFixed(4)}  [M][K/J][H][E][[ ]][; '][G][B][N][S]`;
+  const w = textWidth(hud) + 24;
+  noStroke();
+  fill(0, 140);
+  rect(width - w - 20, height - 50, w, 34, 10);
+  fill(230);
+  textAlign(RIGHT, CENTER);
+  textSize(14);
+  text(hud, width - 32, height - 33);
+}
+
+function keyPressed(){
+  if (key==='M'||key==='m') toggleMic();
+  if (key==='K'||key==='k') sensitivity = Math.min(3.0, sensitivity + 0.08);
+  if (key==='J'||key==='j') sensitivity = Math.max(0.5, sensitivity - 0.08);
+  if (key==='H'||key==='h') extraBassBias = !extraBassBias;
+  if (key==='N'||key==='n') paletteIndex = (paletteIndex+1)%palettes.length;
+  if (key==='E'||key==='e') echoEnabled = !echoEnabled;
+  if (key==='G'||key==='g') showSkank = !showSkank;
+  if (key==='B'||key==='b') bubblesOn = !bubblesOn;
+  if (key==='S'||key==='s') subtleMode = !subtleMode;
+  if (key===']') echoFeedback = Math.min(0.85, echoFeedback + 0.03);
+  if (key==='[') echoFeedback = Math.max(0.00, echoFeedback - 0.03);
+  if (key==="'") echoDelayMs = Math.min(1200, echoDelayMs + 20);
+  if (key===';') echoDelayMs = Math.max(120, echoDelayMs - 20);
+}
+
+function windowResized(){
+  resizeCanvas(windowWidth, windowHeight);
+  pg = createGraphics(width, height);
+  pg.background(0);
+  initParticles();
+}
+
+/* ===== MIC ===== */
+async function toggleMic(){
+  try{
+    if (!mic) mic = new p5.AudioIn();
+    if (!audioEnabled){
+      await mic.start();
+      fft.setInput(mic);
+      amp.setInput(mic);
+      audioEnabled = true;
+      document.getElementById('mic-hint').style.display = 'none';
+    } else {
+      mic.stop();
+      audioEnabled = false;
+      document.getElementById('mic-hint').style.display = 'block';
+    }
+  } catch(e){
+    console.warn('Mic error:', e);
+    document.getElementById('mic-hint').textContent =
+      'Mic blocked — enable permissions or use Chrome site mic settings (choose BlackHole). Press M to retry.';
+  }
+}
+</script>
+</body>
+</html>
