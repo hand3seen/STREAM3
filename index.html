@@ -18,6 +18,17 @@
       padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.12)}
     #meter{position:fixed;left:18px;bottom:18px;width:240px;height:10px;background:#111;border:1px solid #333;border-radius:999px;overflow:hidden}
     #meter > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#27ffbe,#4ca5ff)}
+
+    /* Device picker UI */
+    #audio-ctrl{
+      position:fixed; right:18px; bottom:18px; z-index:10;
+      background:rgba(0,0,0,.55); border:1px solid rgba(255,255,255,.15);
+      padding:10px; border-radius:12px; display:flex; gap:8px; align-items:center
+    }
+    #inputSelect, #armBtn{
+      font-size:12px; background:#0a0a0a; color:#e8f3ff;
+      border:1px solid #333; border-radius:8px; padding:6px 8px
+    }
   </style>
 </head>
 <body>
@@ -28,19 +39,25 @@
   <div id="mic-hint">Press <b>M</b> to (re)enable mic/monitor • [K/J] Sens • [H] Bass bias • [E] Echo • [ / ] Feedback • [; / '] Delay • [G] Skank • [B] Bubbles • [N] Palette • [S] Subtle</div>
   <div id="meter"><i></i></div>
 
+  <!-- Device picker UI -->
+  <div id="audio-ctrl">
+    <select id="inputSelect"></select>
+    <button id="armBtn">🎙️ Arm (M)</button>
+  </div>
+
 <script>
 /* ===== Headmosh Echo Yard — Dub Reactive =====
-   - Bass "bubbles" that float up on lows
-   - Tape-echo rings with feedback + delay time
-   - Skank grid pops on off-beats (2 & 4 vibes)
-   - Softer overall bloom; calmer trails for dub
+   - Bass "bubbles" on lows
+   - Tape-echo rings (delay/feedback)
+   - Skank grid on off-beats
+   - Device picker + robust audio constraints
 ================================================================ */
 
 const CONFIG = {
   particleDensity: 0.08,
   maxSpeed: 1.2,
-  trailAlpha: 26,         // softer trail
-  bloomPasses: 0,         // off for subtle dub look
+  trailAlpha: 26,
+  bloomPasses: 0,
   connectRadius: 160,
   bannerTitle: "HEADMOSH STUDIO",
   bannerSub: "Dub • Echo • Yard",
@@ -58,7 +75,7 @@ let subtleMode = true;
 let mic, fft, amp, peakLow, peakMid;
 let audioEnabled = false;
 let energy = 0;
-let sensitivity = 1.35;         // slightly calmer default
+let sensitivity = 1.35;
 let extraBassBias = true;
 
 // Auto-gain
@@ -69,21 +86,99 @@ const RMS_DECAY  = 0.015;
 // Echo system
 let echoEnabled = true;
 let echoes = []; // {x,y,r,life,clr,vel}
-let echoDelayMs = 420;   // dubby default
-let echoFeedback = 0.52; // 0..0.85 reasonable
+let echoDelayMs = 420;
+let echoFeedback = 0.52;
 let lastEchoAt = 0;
 
-// Bubbles (bass pops)
+// Bubbles
 let bubblesOn = true;
 let bubblePool = []; // {x,y,r,vy,life,clr}
 
 // Skank grid
 let showSkank = true;
-let beatTimes = []; // recent kick beats (ms)
+let beatTimes = [];
 let lastBeatAt = 0;
 
-// Particles (chill backdrop)
+// Particles
 let particles = [];
+
+/* ========= DEVICE PICKER + ROBUST MIC ========= */
+let selectedDeviceId = null;
+
+async function listInputs(){
+  try{
+    // Prompt once so labels are visible
+    await navigator.mediaDevices.getUserMedia({audio:true})
+      .then(s => s.getTracks().forEach(t=>t.stop())).catch(()=>{});
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const inputs = devices.filter(d => d.kind === 'audioinput');
+
+    const sel = document.getElementById('inputSelect');
+    sel.innerHTML = '';
+    inputs.forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = d.deviceId;
+      opt.textContent = d.label || `Input ${sel.length+1}`;
+      sel.appendChild(opt);
+      if (/blackhole/i.test(d.label)) selectedDeviceId = d.deviceId; // prefer BlackHole
+    });
+    if (!selectedDeviceId && inputs[0]) selectedDeviceId = inputs[0].deviceId;
+    sel.value = selectedDeviceId || '';
+  }catch(e){ console.warn('Device list error', e); }
+}
+
+async function startWithDevice(deviceId){
+  const constraints = {
+    audio: {
+      deviceId: deviceId ? { exact: deviceId } : undefined,
+      channelCount: 2,
+      sampleRate: 48000,
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    }
+  };
+  const ctx = getAudioContext();
+  if (ctx.state !== 'running') await ctx.resume();
+
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  if (!mic) mic = new p5.AudioIn();
+  // p5: start(success, error, stream)
+  await mic.start(undefined, undefined, stream);
+  fft.setInput(mic);
+  amp.setInput(mic);
+  audioEnabled = true;
+  document.getElementById('mic-hint').style.display = 'none';
+}
+
+function wirePickerUI(){
+  const sel = document.getElementById('inputSelect');
+  const btn = document.getElementById('armBtn');
+  sel.addEventListener('change', e => { selectedDeviceId = e.target.value; });
+  btn.addEventListener('click', async () => {
+    try{ await startWithDevice(selectedDeviceId); }catch(e){ console.warn(e); }
+  });
+  navigator.mediaDevices.addEventListener?.('devicechange', () => listInputs());
+}
+
+document.addEventListener('DOMContentLoaded', async () => { await listInputs(); wirePickerUI(); });
+// Override toggleMic to use selected device
+async function toggleMic(){
+  try{
+    if (!audioEnabled){
+      await startWithDevice(selectedDeviceId);
+    } else {
+      if (mic) mic.stop();
+      audioEnabled = false;
+      document.getElementById('mic-hint').style.display = 'block';
+    }
+  }catch(e){
+    console.warn('Mic error:', e);
+    document.getElementById('mic-hint').textContent =
+      'Mic blocked — enable permissions or set site mic to BlackHole, then pick it below and press Arm/M.';
+  }
+}
+/* ======== END DEVICE PICKER ======== */
 
 function setup(){
   pixelDensity(1);
@@ -92,24 +187,19 @@ function setup(){
   pg.background(0);
 
   palettes = [
-    // headmosh minimal w/ dub hints
     [ [10,240,255], [255,210,60], [255,80,180], [180,90,255] ],
-    // warm sunset
     [ [255,120,60], [255,200,80], [90,200,255], [200,160,255] ],
-    // rasta-leaning (muted)
     [ [210,40,30], [230,190,40], [40,160,60], [120,220,200] ],
-    // ice & magenta
     [ [120,240,255], [255,120,220], [255,240,160], [90,120,255] ],
   ];
 
-  // ambient particles
   initParticles();
 
   // audio chain tuned for dub
   fft = new p5.FFT(0.08, 2048);
   amp = new p5.Amplitude(0.02);
-  peakLow = new p5.PeakDetect(35, 140, 0.10, 20); // kick/bass
-  peakMid = new p5.PeakDetect(600, 2000, 0.18, 12); // skank/clav
+  peakLow = new p5.PeakDetect(35, 140, 0.10, 20);
+  peakMid = new p5.PeakDetect(600, 2000, 0.18, 12);
 }
 
 function initParticles(){
@@ -141,18 +231,15 @@ function draw(){
     const mid  = fft.getEnergy(600, 2000);
     const high = fft.getEnergy(2000, 6000);
 
-    // amplitude normalize
     const lvl = amp.getLevel();
     const targetRms = lvl;
     if (targetRms > rms) rms += (targetRms - rms) * RMS_ATTACK;
     else rms += (targetRms - rms) * RMS_DECAY;
     const norm = rms > 0.0005 ? constrain(lvl / (rms*1.25), 0, 3.0) : 0;
 
-    // weighted energy; dub leans bass & mids
     let e = (low * BASS_BIAS + mid * 0.28 + high * 0.05) / 255;
     e = Math.max(e, norm * 0.85);
 
-    // peak detection
     peakLow.update(fft);
     peakMid.update(fft);
 
@@ -171,7 +258,7 @@ function draw(){
 
   energy += (target - energy) * (target > energy ? ATTACK : DECAY);
 
-  // ---------- RENDER LAYERS ----------
+  // ---------- RENDER ----------
   pg.noStroke();
   pg.fill(0, CONFIG.trailAlpha);
   pg.rect(0,0,width,height);
@@ -182,7 +269,6 @@ function draw(){
   renderBubbles(pg);
   if (showSkank) renderSkankGrid(pg);
 
-  // occasional soft screen flash on strong hits
   if (!subtleMode && energy > 1.05){
     push();
     drawingContext.globalCompositeOperation = 'screen';
@@ -192,14 +278,12 @@ function draw(){
   }
 
   image(pg, 0, 0);
-  // (Bloom intentionally off by default for dub)
 
   drawBanner();
   drawHUD(levelVis);
 }
 
 function drawBackdrop(g){
-  // vinyl wobble center glow
   const wob = 1 + Math.sin(t*0.008 + energy*2.2)*0.02;
   const cx = width*0.5 + Math.sin(t*0.0011)*60*(0.5+energy*0.8);
   const cy = height*0.5 + Math.cos(t*0.0012)*44*(0.5+energy*0.8);
@@ -215,13 +299,11 @@ function drawBackdrop(g){
 function moveParticles(g){
   const cols = palettes[paletteIndex];
   for (let p of particles){
-    // gentle flow + energy push
     const ang = noise(p.x*0.0011, p.y*0.0011, t*0.001)*TAU*(0.9+energy*0.9);
     const push = (0.02 + energy*0.09);
     p.vx += Math.cos(ang) * push;
     p.vy += Math.sin(ang) * push;
 
-    // clamp
     const sp = Math.hypot(p.vx, p.vy);
     const ms = CONFIG.maxSpeed*(0.8 + energy*0.6);
     if (sp > ms){ p.vx = (p.vx/sp)*ms; p.vy = (p.vy/sp)*ms; }
@@ -230,12 +312,10 @@ function moveParticles(g){
     if (p.x < -12) p.x = width+12; if (p.x > width+12) p.x = -12;
     if (p.y < -12) p.y = height+12; if (p.y > height+12) p.y = -12;
 
-    // dots
     g.noStroke();
     g.fill(255, 210);
     g.circle(p.x, p.y, 2.4 + energy*1.4);
 
-    // short “wire” links for cohesion
     if (random() < 0.035){
       const q = particles[(p.__i || 0 + floor(random(5,20))) % particles.length];
       const d = dist(p.x,p.y,q.x,q.y);
@@ -250,14 +330,11 @@ function moveParticles(g){
 }
 
 function renderEchoes(g){
-  // rings expand & fade; feedback re-injects smaller rings
   const cols = palettes[paletteIndex];
   const now = millis();
 
-  // feedback: create delayed child rings
   if (echoEnabled && now - lastEchoAt >= echoDelayMs && beatTimes.length){
     lastEchoAt = now;
-    // spawn an echo at center with small random offset
     const cx = width*0.5 + random(-30,30);
     const cy = height*0.5 + random(-20,20);
     const base = cols[int(random(cols.length))];
@@ -266,11 +343,9 @@ function renderEchoes(g){
       vel: 3.2 + energy*2.2,
       clr: [base[0], base[1], base[2], 210]
     });
-    // attenuate existing via feedback feel
     for (let e of echoes) e.life *= (0.92 + echoFeedback*0.05);
   }
 
-  // draw/update
   g.noFill();
   for (let i=echoes.length-1; i>=0; i--){
     const e = echoes[i];
@@ -285,7 +360,6 @@ function renderEchoes(g){
 }
 
 function renderBubbles(g){
-  // update bubbles
   for (let i=bubblePool.length-1; i>=0; i--){
     const b = bubblePool[i];
     b.y += b.vy;
@@ -300,13 +374,11 @@ function renderBubbles(g){
 }
 
 function renderSkankGrid(g){
-  // find rough bpm from kick intervals
   const bpm = estimateBPM();
   if (!bpm) return;
   const spb = 60000 / bpm;
   const now = millis();
   const since = now - (beatTimes[beatTimes.length-1] || now);
-  // off-beat emphasis around half-spb window
   const offBeatPhase = abs((since % spb) - spb/2);
   const throb = map(offBeatPhase, 0, spb/3, 1, 0, true) * (0.5 + energy*0.8);
 
@@ -315,7 +387,6 @@ function renderSkankGrid(g){
   g.push();
   g.stroke(c[0], c[1], c[2], 90 + throb*120);
   g.strokeWeight(2.2 + throb*2);
-  // diagonal “skank” lines
   const gap = 48;
   const off = (t*0.9) % gap;
   for (let y=-gap; y<height+gap; y+=gap){
@@ -325,7 +396,6 @@ function renderSkankGrid(g){
 }
 
 function estimateBPM(){
-  // simple: average last 6 kick intervals
   if (beatTimes.length < 4) return null;
   const arr = beatTimes.slice(-6);
   let iv = [];
@@ -343,7 +413,6 @@ function onKick(){
   beatTimes.push(now);
   if (beatTimes.length > 12) beatTimes.shift();
 
-  // spawn echo seed immediately (parent ring)
   if (echoEnabled){
     const cols = palettes[paletteIndex];
     const base = cols[int(random(cols.length))];
@@ -356,7 +425,6 @@ function onKick(){
     });
   }
 
-  // spawn bubbles on bass
   if (bubblesOn){
     const cols = palettes[paletteIndex];
     const base = cols[int(random(cols.length))];
@@ -375,7 +443,6 @@ function onKick(){
 }
 
 function onSkank(){
-  // small color flicker by nudging palette
   if (random() < 0.22) paletteIndex = (paletteIndex+1)%palettes.length;
 }
 
@@ -439,28 +506,6 @@ function windowResized(){
   pg = createGraphics(width, height);
   pg.background(0);
   initParticles();
-}
-
-/* ===== MIC ===== */
-async function toggleMic(){
-  try{
-    if (!mic) mic = new p5.AudioIn();
-    if (!audioEnabled){
-      await mic.start();
-      fft.setInput(mic);
-      amp.setInput(mic);
-      audioEnabled = true;
-      document.getElementById('mic-hint').style.display = 'none';
-    } else {
-      mic.stop();
-      audioEnabled = false;
-      document.getElementById('mic-hint').style.display = 'block';
-    }
-  } catch(e){
-    console.warn('Mic error:', e);
-    document.getElementById('mic-hint').textContent =
-      'Mic blocked — enable permissions or use Chrome site mic settings (choose BlackHole). Press M to retry.';
-  }
 }
 </script>
 </body>
